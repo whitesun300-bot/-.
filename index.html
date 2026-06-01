@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLOv8 실시간 객체 탐지</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin: 0; background: #111; color: #fff; overflow: hidden; }
+        #status { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 10; font-weight: bold; background: rgba(0,0,0,0.7); padding: 8px 16px; border-radius: 20px; font-size: 14px; }
+        #canvas-container { position: relative; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        video { display: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+    </style>
+</head>
+<body>
+
+    <div id="status">🤖 모델 로딩 중... (약 14MB)</div>
+
+    <div id="canvas-container">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="display_canvas"></canvas>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('display_canvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+
+        let session;
+        const modelWidth = 640;
+        const modelHeight = 640;
+
+        // COCO 클래스 라벨 (80개 전체 목록)
+        const labels = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"];
+
+        async function startApp() {
+            try {
+                // 1. 스마트폰 후면 카메라 구동
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+                    audio: false
+                });
+                video.srcObject = stream;
+                await video.play();
+
+                // 2. ONNX 인프라 초기화 (WASM 환경 빌드 후 WebGL 그래픽 가속 적용)
+                statusDiv.innerText = "⚡ 그래픽 장치 최적화 중...";
+                session = await ort.InferenceSession.create('yolov8n.onnx', { executionProviders: ['webgl', 'wasm'] });
+
+                statusDiv.innerText = "🎯 탐지 준비 완료! 사물을 비춰보세요.";
+                statusDiv.style.color = "#00ff00";
+
+                // 캔버스 크기를 스마트폰 카메라 실제 해상도와 동기화
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                // 실시간 탐지 루프 시작
+                requestAnimationFrame(processFrame);
+            } catch (err) {
+                statusDiv.innerText = "❌ 오류: 카메라 권한 거부 또는 모델 로드 실패";
+                statusDiv.style.color = "#ff0000";
+                console.error(err);
+            }
+        }
+
+        async function processFrame() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                // 1. 캔버스에 실시간 카메라 영상 그리기
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                // 2. [전처리] 현재 카메라 프레임을 640x640 크기의 Float32형 텐서 배열로 변환
+                const inputTensor = preprocess(video, modelWidth, modelHeight);
+
+                if (inputTensor) {
+                    try {
+                        // 3. [추론] YOLO 모델 가동
+                        const outputs = await session.run({ images: inputTensor });
+                        const output = outputs[Object.keys(outputs)[0]];
+
+                        // 4. [후처리] 사물 위치 분석 및 바운딩 박스 시각화
+                        postprocess(output.data, output.dims);
+                    } catch (e) {
+                        console.error("추론 중 에러 발생:", e);
+                    }
+                }
+            }
+            // 다음 프레임 연속 실행
+            requestAnimationFrame(processFrame);
+        }
+
+        // 이미지 전처리 함수 (카메라 영상을 모델 규격에 맞게 정규화)
+        function preprocess(img, width, height) {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = width;
+            tempCanvas.height = height;
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.drawImage(img, 0, 0, width, height);
+
+            const imgData = tempCtx.getImageData(0, 0, width, height);
+            const data = imgData.data;
+
+            const r = new Float32Array(width * height);
+            const g = new Float32Array(width * height);
+            const b = new Float32Array(width * height);
+
+            // 픽셀 분리 및 0~1 사이로 채널별 정규화 (YOLOv8 표준 규격)
+            for (let i = 0; i < data.length / 4; i++) {
+                r[i] = data[i * 4] / 255.0;
+                g[i] = data[i * 4 + 1] / 255.0;
+                b[i] = data[i * 4 + 2] / 255.0;
+            }
+
+            const float32Data = new Float32Array(width * height * 3);
+            float32Data.set(r, 0);
+            float32Data.set(g, width * height);
+            float32Data.set(b, width * height * 2);
+
+            return new ort.Tensor('float32', float32Data, [1, 3, width, height]);
+        }
+
+        // 정밀 후처리 함수 (YOLOv8 8400개 행렬 결과 분해 및 박스 렌더링)
+        function postprocess(data, dims) {
+            const numAttributes = dims[1]; // 84 (4개 좌표 + 80개 클래스 확률)
+            const numBoxes = dims[2];      // 8400 (예측된 총 박스 후보군 수)
+
+            // 중복 검출을 줄이고 연산 속도를 보장하기 위해 한 프레임당 최대 15개 후보군만 선별 출력하도록 루프 제한
+            for (let i = 0; i < numBoxes; i += 12) {
+                let maxScore = 0;
+                let classId = -1;
+
+                // 80개 클래스 점수 중 가장 높은 값 판별
+                for (let c = 4; c < numAttributes; c++) {
+                    const score = data[c * numBoxes + i];
+                    if (score > maxScore) {
+                        maxScore = score;
+                        classId = c - 4;
+                    }
+                }
+
+                // 확신도가 45% 이상(0.45)인 확실한 오브젝트만 선별
+                if (maxScore > 0.45) {
+                    // YOLOv8 출력 좌표계([중심X, 중심Y, 가로, 세로])를 실제 화면 크기에 맞게 복원
+                    const cx = data[0 * numBoxes + i] / modelWidth * canvas.width;
+                    const cy = data[1 * numBoxes + i] / modelHeight * canvas.height;
+                    const w = data[2 * numBoxes + i] / modelWidth * canvas.width;
+                    const h = data[3 * numBoxes + i] / modelHeight * canvas.height;
+
+                    // 사각형의 좌상단(X, Y) 시작 좌표 계산
+                    const x = cx - w / 2;
+                    const y = cy - h / 2;
+
+                    // 1. 바운딩 박스 선 그리기 (형광 연두색)
+                    ctx.strokeStyle = "#00ff55";
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(x, y, w, h);
+
+                    // 2. 상단 텍스트 배경 라벨지 그리기
+                    ctx.fillStyle = "#00ff55";
+                    const text = `${labels[classId]} ${Math.round(maxScore * 100)}%`;
+                    ctx.font = "bold 14px sans-serif";
+                    const textWidth = ctx.measureText(text).width;
+                    ctx.fillRect(x - 2, y - 22, textWidth + 10, 20);
+
+                    // 3. 흰색 글씨로 클래스명과 확률 작성
+                    ctx.fillStyle = "#111";
+                    ctx.fillText(text, x + 3, y - 7);
+                }
+            }
+        }
+
+        window.onload = startApp;
+    </script>
+</body>
+</html>
